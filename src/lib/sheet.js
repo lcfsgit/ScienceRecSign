@@ -1,5 +1,17 @@
 import * as XLSX from 'xlsx'
 import JSZip from 'jszip'
+import { looksLikeFileTree } from './tree.js'
+import {
+  PAPER_HEADER,
+  PAPER_LABEL,
+  SCORE_OPTIONS,
+  VALUE_KEYS,
+  matchValueColumn,
+  scoreHeader,
+  scoreLabel,
+  yesHeader,
+  yesLabel
+} from './valueLabels.js'
 
 const OPTION_SHEET_RE = /^(选项|可选项|选项表|字典|options?|dict|配置)$/i
 
@@ -53,6 +65,8 @@ export async function loadWorkbook(buffer, filename) {
   let workbook
   if (bookType === 'csv') {
     workbook = XLSX.read(decodeCsv(originalBuffer), { type: 'string' })
+  } else if (bookType === 'xls') {
+    workbook = XLSX.read(originalBuffer.slice(0), { type: 'array', cellDates: true, codepage: 936 })
   } else {
     workbook = XLSX.read(originalBuffer.slice(0), { type: 'array', cellDates: true })
   }
@@ -143,7 +157,7 @@ function withLabelHeaders(views, edits) {
     for (const col of view.columns || []) {
       if (!col.synthetic) continue
       const addr = cellAddress(view.headerRow, col.col)
-      if (sheetEdits[addr] == null) sheetEdits[addr] = col.headerRaw || '打标结果'
+      if (sheetEdits[addr] == null) sheetEdits[addr] = col.headerRaw || col.label
     }
   }
   return merged
@@ -183,18 +197,52 @@ function isOptionSheet(name) {
 
 function decodeCsv(buffer) {
   const bytes = new Uint8Array(buffer)
-  let utf8 = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
-  if (utf8.charCodeAt(0) === 0xfeff) utf8 = utf8.slice(1)
-  const bad = (utf8.match(/\uFFFD/g) || []).length
-  if (!bad) return utf8
-  try {
-    const gbk = new TextDecoder('gbk').decode(bytes)
-    const badGbk = (gbk.match(/\uFFFD/g) || []).length
-    if (badGbk < bad) return gbk
-  } catch {
-    /* 当前环境没有 GBK 解码器时保留 UTF-8 结果 */
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return new TextDecoder('utf-8').decode(bytes.subarray(3))
   }
-  return utf8
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return new TextDecoder('utf-16le').decode(bytes.subarray(2))
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return new TextDecoder('utf-16be').decode(bytes.subarray(2))
+  }
+
+  let utf8 = ''
+  let utf8Fatal = false
+  try {
+    utf8 = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    utf8Fatal = true
+  } catch {
+    utf8 = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+  }
+
+  const legacy = decodeLegacyChinese(bytes)
+  if (!legacy) return utf8
+  if (utf8Fatal && scoreText(utf8) >= scoreText(legacy)) return utf8
+  return scoreText(legacy) > scoreText(utf8) ? legacy : utf8
+}
+
+function decodeLegacyChinese(bytes) {
+  for (const label of ['gb18030', 'gbk']) {
+    try {
+      return new TextDecoder(label).decode(bytes)
+    } catch {
+      /* 继续尝试下一个编码 */
+    }
+  }
+  return ''
+}
+
+function scoreText(text) {
+  let score = 0
+  for (const ch of String(text)) {
+    const code = ch.codePointAt(0)
+    if (ch === '\uFFFD') score -= 8
+    else if (code >= 0x4e00 && code <= 0x9fff) score += 3
+    else if ('，。：；！？、《》【】（）""'.includes(ch)) score += 2
+    else if (code >= 0x80 && code < 0x100) score -= 1
+  }
+  return score
 }
 
 function cellText(cell) {
@@ -203,6 +251,8 @@ function cellText(cell) {
     if (Array.isArray(cell.v.richText)) return cell.v.richText.map((part) => part.text || '').join('')
     if (cell.v.text) return String(cell.v.text)
   }
+  if (typeof cell.v === 'string') return cell.v
+  if (cell.t === 's') return String(cell.v)
   if (typeof cell.w === 'string' && cell.w !== '') return cell.w
   if (cell.v instanceof Date && !Number.isNaN(cell.v.getTime())) {
     const y = cell.v.getFullYear()
@@ -298,13 +348,13 @@ function buildView(ws, validationMap, dictionary, labelColumn = false) {
 
   markIdColumns(columns, rows)
   markVersionColumns(columns, rows)
-  if (labelColumn) ensureLabelColumn(columns, rows)
+  if (labelColumn) ensureLabelColumns(columns, rows)
   return { columns, rows, banner, headerRow }
 }
 
 function markIdColumns(columns, rows) {
   for (const col of columns) {
-    if (col.role === 'label-result') continue
+    if (isLabelRole(col.role)) continue
     const values = rows.map((row) => String(row.cells[col.index] ?? ''))
     if (!isIdColumn(col, values)) continue
     col.hidden = true
@@ -329,7 +379,7 @@ function isIdColumn(col, values) {
 
 function markVersionColumns(columns, rows) {
   for (const col of columns) {
-    if (col.role === 'label-result' || col.hidden) continue
+    if (isLabelRole(col.role) || col.hidden) continue
     const values = rows.map((row) => String(row.cells[col.index] ?? ''))
     if (!isVersionColumn(col, values)) continue
     col.role = 'version'
@@ -351,40 +401,134 @@ function isVersionColumn(col, values) {
   return nonEmpty.every((value) => version.test(value))
 }
 
-function ensureLabelColumn(columns, rows) {
-  const existing = columns.find((col) => col.label === '打标结果' || col.headerRaw === '打标结果')
-  if (existing) {
-    existing.role = 'label-result'
-    existing.mode = 'single'
-    existing.options = ['1', '0']
-    existing.optionSource = '打标'
-    existing.track = true
-    existing.synthetic = false
-    existing.longText = false
-    existing.hidden = false
-    return
+function isLabelRole(role) {
+  return role === 'label-result' || role === 'label-paper' || role === 'label-yes' || role === 'label-score'
+}
+
+function ensureLabelColumns(columns, rows) {
+  for (const col of columns) {
+    const hit = matchValueColumn(col.headerRaw, col.label)
+    if (!hit) continue
+    if (hit.kind === 'result') applyResultColumn(col, false)
+    else if (hit.kind === 'paper') applyPaperColumn(col, false)
+    else if (hit.kind === 'yes') applyYesColumn(col, hit.key, false)
+    else if (hit.kind === 'score') applyScoreColumn(col, hit.key, false)
   }
-  const nextCol = columns.reduce((max, col) => Math.max(max, col.col), -1) + 1
-  columns.push({
-    index: columns.length,
-    col: nextCol,
-    letter: XLSX.utils.encode_col(nextCol),
-    headerRaw: '打标结果',
-    label: '打标结果',
-    mode: 'single',
-    options: ['1', '0'],
-    optionSource: '打标',
-    separator: '、',
-    track: true,
-    role: 'label-result',
-    synthetic: true,
-    longText: false,
-    hidden: false
+
+  ensureColumn(columns, rows, {
+    find: (col) =>
+      col.role === 'label-paper' ||
+      col.label === PAPER_LABEL ||
+      col.headerRaw === PAPER_HEADER,
+    create: () => applyPaperColumn(baseColumn(columns, PAPER_HEADER, PAPER_LABEL), true)
   })
+
+  for (const key of VALUE_KEYS) {
+    ensureColumn(columns, rows, {
+      find: (col) => col.role === 'label-score' && col.valueKey === key,
+      create: () => applyScoreColumn(baseColumn(columns, scoreHeader(key), scoreLabel(key)), key, true)
+    })
+  }
+}
+
+function ensureColumn(columns, rows, { find, create }) {
+  if (columns.some(find)) return
+  const col = create()
+  columns.push(col)
   for (const row of rows) {
     row.cells.push('')
     row.original.push('')
   }
+}
+
+function baseColumn(columns, headerRaw, label) {
+  const nextCol = columns.reduce((max, col) => Math.max(max, col.col), -1) + 1
+  return {
+    index: columns.length,
+    col: nextCol,
+    letter: XLSX.utils.encode_col(nextCol),
+    headerRaw,
+    label,
+    mode: 'single',
+    options: [],
+    optionSource: '',
+    separator: '、',
+    track: true,
+    role: '',
+    synthetic: true,
+    longText: false,
+    hidden: false,
+    valueKey: '',
+    valueKind: ''
+  }
+}
+
+function applyResultColumn(col, synthetic) {
+  col.role = 'label-result'
+  col.mode = 'single'
+  col.options = ['1', '0']
+  col.optionSource = '打标'
+  col.track = false
+  col.longText = false
+  col.hidden = true
+  col.label = col.label || '打标结果'
+  col.headerRaw = col.headerRaw || '打标结果'
+  if (synthetic) col.synthetic = true
+  else col.synthetic = Boolean(col.synthetic)
+  col.valueKey = ''
+  col.valueKind = 'result'
+  return col
+}
+
+function applyPaperColumn(col, synthetic) {
+  col.role = 'label-paper'
+  col.mode = 'single'
+  col.options = ['1', '0']
+  col.optionSource = '打标'
+  col.track = true
+  col.longText = false
+  col.hidden = false
+  col.label = PAPER_LABEL
+  col.headerRaw = col.headerRaw || PAPER_HEADER
+  if (synthetic) col.synthetic = true
+  else col.synthetic = Boolean(col.synthetic)
+  col.valueKey = ''
+  col.valueKind = 'paper'
+  return col
+}
+
+function applyYesColumn(col, key, synthetic) {
+  col.role = 'label-yes'
+  col.mode = 'single'
+  col.options = ['1', '0']
+  col.optionSource = '价值维度'
+  col.track = false
+  col.longText = false
+  col.hidden = true
+  col.valueKey = key
+  col.valueKind = 'yes'
+  col.headerRaw = col.headerRaw || yesHeader(key)
+  col.label = yesLabel(key)
+  if (synthetic) col.synthetic = true
+  else col.synthetic = Boolean(col.synthetic)
+  return col
+}
+
+function applyScoreColumn(col, key, synthetic) {
+  col.role = 'label-score'
+  col.mode = 'single'
+  col.options = SCORE_OPTIONS.slice()
+  col.optionSource = '价值分档'
+  col.track = true
+  col.longText = false
+  col.hidden = false
+  col.valueKey = key
+  col.valueKind = 'score'
+  col.headerRaw = col.headerRaw || scoreHeader(key)
+  col.label = scoreLabel(key)
+  if (synthetic) col.synthetic = true
+  else col.synthetic = Boolean(col.synthetic)
+  return col
 }
 
 function inferColumn(header, index, values, validationOptions, dictionary) {
@@ -396,7 +540,18 @@ function inferColumn(header, index, values, validationOptions, dictionary) {
   let source = ''
   let separator = '、'
 
-  if (parsed.options) {
+  const trimmed = values.map((value) => String(value ?? '').trim())
+  const nonEmpty = trimmed.filter(Boolean)
+  const treeish = nonEmpty.filter((value) => looksLikeFileTree(value))
+  const fileTree =
+    treeish.length > 0 &&
+    (nonEmpty.length === 1
+      ? treeish.length === 1
+      : treeish.length >= 2 && treeish.length / nonEmpty.length >= 0.5)
+
+  if (fileTree) {
+    // 目录树列：不做选项归纳，避免对大 JSON 按逗号拆分拖垮加载
+  } else if (parsed.options) {
     options = parsed.options
     mode = parsed.mode || 'single'
     source = '表头'
@@ -433,14 +588,14 @@ function inferColumn(header, index, values, validationOptions, dictionary) {
     if (detected) separator = detected
   }
 
-  const trimmed = values.map((value) => value.trim())
-  const nonEmpty = trimmed.filter(Boolean)
   const emptyRatio = values.length ? (values.length - nonEmpty.length) / values.length : 1
   const avg = nonEmpty.reduce((sum, value) => sum + value.length, 0) / (nonEmpty.length || 1)
   let track = mode !== 'text' || emptyRatio >= 0.35
   if (mode === 'text' && avg > 80 && emptyRatio < 0.6) track = false
-  const longest = values.reduce((max, value) => Math.max(max, String(value).length), 0)
-  const longText = mode === 'text' && (longest > 42 || values.some((value) => /[\r\n]/.test(String(value))))
+  if (fileTree) track = false
+  const prose = fileTree ? [] : values.filter((value) => !looksLikeFileTree(value))
+  const longest = prose.reduce((max, value) => Math.max(max, String(value).length), 0)
+  const longText = fileTree || (mode === 'text' && (longest > 42 || prose.some((value) => /[\r\n]/.test(String(value)))))
 
   return {
     index,
@@ -450,12 +605,13 @@ function inferColumn(header, index, values, validationOptions, dictionary) {
     label,
     mode,
     options,
-    optionSource: source,
+    optionSource: fileTree ? '目录树' : source,
     separator,
     track,
-    role: '',
+    role: fileTree ? 'file-tree' : '',
     synthetic: false,
     longText,
+    fileTree,
     hidden: false
   }
 }
@@ -500,8 +656,11 @@ function inferKnown(values) {
 }
 
 function inferMulti(values) {
-  const nonEmpty = values.map((value) => value.trim()).filter(Boolean)
+  const nonEmpty = values
+    .map((value) => String(value ?? '').trim())
+    .filter((value) => value && !looksLikeFileTree(value) && value.length <= 120)
   if (nonEmpty.length < 2) return null
+  if (nonEmpty.some((value) => value.length > 80 && /[{[]/.test(value))) return null
   const seps = ['|', '、', '，', ',', ';', '；']
   for (const sep of seps) {
     const hits = nonEmpty.filter((value) => value.includes(sep))
@@ -510,8 +669,14 @@ function inferMulti(values) {
     const tokens = []
     for (const value of nonEmpty) {
       for (const part of value.split(sep).map((item) => item.trim()).filter(Boolean)) {
+        if (part.length > 24) {
+          tokens.length = 0
+          break
+        }
         if (!tokens.includes(part)) tokens.push(part)
+        if (tokens.length > 20) break
       }
+      if (!tokens.length || tokens.length > 20) break
     }
     if (tokens.length >= 2 && tokens.length <= 20 && tokens.every((token) => token.length <= 24)) {
       return { options: tokens, separator: sep }

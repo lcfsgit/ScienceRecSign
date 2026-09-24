@@ -4,7 +4,7 @@ import JSZip from 'jszip'
 export async function buildDemoBuffer() {
   const headers = ['标题', '摘要', '学科[计算机|生物|物理|化学|医学]', '相关性', '来源类型', '推荐等级', '备注', '论文ID', '版本号']
   const data = [
-    ['图神经网络在药物重定位中的应用', '<p>本文提出一种面向<b>药物与靶点</b>关系的图神经网络，用可解释子结构定位潜在适应症。</p><p>并在公开图谱上<span style="color:#d6ff3f">验证召回</span>。</p>', '生物 ', '', '期刊', '', '', 'P2026001', '3.2.0'],
+    ['图神经网络在药物重定位中的应用', '<p>本文提出一种面向<b>药物与靶点</b>关系的图神经网络，用可解释子结构定位潜在适应症。</p><p>并在公开图谱上<span style="color:#d6ff3f">验证召回</span>。</p>', '生物 ', '', '期刊', '', '{"file_tree":{"id":"v1","fileName":"V1","path":"/V1","type":"folder","dir":true,"size":0,"children":[{"id":"csv","fileName":"data.csv","path":"/V1/data.csv","type":"file","dir":false,"size":1024},{"id":"raw","fileName":"raw","path":"/V1/raw","type":"folder","dir":true,"size":0,"children":[{"id":"notes","fileName":"notes.txt","path":"/V1/raw/notes.txt","type":"file","dir":false,"size":256}]}]}}', 'P2026001', '3.2.0'],
     ['大科学装置的开放共享机制', '围绕大科学装置的机时分配、数据分级与跨机构共享，讨论可执行的开放规则。', '物理', '', '会议', '', '', 'P2026002', '3.2.1'],
     ['可解释学习在临床影像中的进展', '综述临床影像模型的显著性、概念瓶颈与报告生成，比较它们对审稿与临床阅读的帮助。', '医学', '', '期刊', '', '需要补全推荐等级', 'P2026003', '3.1.0'],
     ['高能物理事例筛选的在线触发', '介绍高亮度对撞环境下的触发系统如何在微秒级延迟内保留稀有事例。', '物理', '', '预印本', '', '', 'P2026004', '3.2.0'],

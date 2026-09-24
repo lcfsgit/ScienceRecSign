@@ -9,8 +9,20 @@ const ALLOWED = new Set([
 const DROP = new Set(['script', 'style', 'iframe', 'object', 'embed', 'link', 'meta', 'noscript', 'svg', 'math', 'form', 'input', 'button', 'textarea'])
 
 const STYLE_PROPS = new Set([
-  'background-color', 'font-weight', 'font-style', 'text-decoration', 'text-align',
-  'font-size', 'font-family', 'line-height', 'vertical-align'
+  'font-weight', 'font-style', 'text-decoration', 'text-align',
+  'line-height', 'vertical-align'
+])
+
+const DROP_STYLE_PROPS = new Set([
+  'color',
+  'background',
+  'background-color',
+  'background-image',
+  'background-size',
+  'background-position',
+  'background-repeat',
+  'font-family',
+  'font-size'
 ])
 
 export function containsHtml(value) {
@@ -97,6 +109,7 @@ function safeStyle(value) {
     if (index < 0) continue
     const prop = chunk.slice(0, index).trim().toLowerCase()
     const val = chunk.slice(index + 1).trim()
+    if (DROP_STYLE_PROPS.has(prop)) continue
     if (!STYLE_PROPS.has(prop) || !val || val.length > 80) continue
     if (/url\s*\(|expression|javascript|@import|[\u0000-\u001f\\]/i.test(val)) continue
     parts.push(`${prop}: ${val}`)

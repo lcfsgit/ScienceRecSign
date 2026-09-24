@@ -1,0 +1,8 @@
+.git
+.cursor
+node_modules
+dist
+*.md
+public/_probe.csv
+public/_probe.xlsx
+k8s-develop.yaml

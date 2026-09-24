@@ -1,0 +1,87 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vue-sdb-rec-sign
+  namespace: sdb-k8s
+  labels:
+    app: vue-sdb-rec-sign
+spec:
+  replicas: 1 #运行容器的副本数，修改这里可以快速修改分布式节点数量
+  selector:
+    matchLabels:
+      app: vue-sdb-rec-sign
+  template:
+    metadata:
+      labels:
+        app: vue-sdb-rec-sign
+    spec:
+      containers:
+        - name: vue-sdb-rec-sign
+          image: registry.cn-hangzhou.aliyuncs.com/sciencedb/vue-sdb-rec-sign:develop # pull镜像的地址 ip:prot/dir/images:tag 这里tag取分支名
+          env:
+            - name: TZ
+              value: Asia/Shanghai
+            - name: APP_HOME
+              value: "/usr/share/nginx/html"
+            - name: SERVER_NAME
+              value: "vue-sdb-rec-sign"
+            - name: SERVER_PORT
+              value: "9093"
+            - name: ENV
+              value: "dev"
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 9093 #容器对外开放端口
+          readinessProbe:
+            httpGet:
+              path: /vue-sdb-rec-sign/
+              port: 9093
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /vue-sdb-rec-sign/
+              port: 9093
+            initialDelaySeconds: 10
+            periodSeconds: 20
+      imagePullSecrets:
+        - name: registry-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vue-sdb-rec-sign
+  namespace: sdb-k8s
+  labels:
+    app: vue-sdb-rec-sign
+spec:
+  type: NodePort # 集群外可通过节点 IP + nodePort 访问
+  selector:
+    app: vue-sdb-rec-sign
+  ports:
+    - name: http
+      port: 9093
+      targetPort: 9093
+      nodePort: 30093
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vue-sdb-rec-sign
+  namespace: sdb-k8s
+  labels:
+    app: vue-sdb-rec-sign
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /vue-sdb-rec-sign
+            pathType: Prefix
+            backend:
+              service:
+                name: vue-sdb-rec-sign
+                port:
+                  number: 9093

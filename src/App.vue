@@ -1,8 +1,17 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
+import FileTree from './components/FileTree.vue'
 import { buildDemoBuffer } from './lib/demo.js'
 import { htmlSource, sanitizeHtml } from './lib/html.js'
-import { buildOutputBytes, cellAddress, inferFromValues, loadWorkbook, mimeOf } from './lib/sheet.js'
+import { buildOutputBytes, cellAddress, loadWorkbook, mimeOf } from './lib/sheet.js'
+import { parseFileTree } from './lib/tree.js'
+import {
+  VALUE_KEYS,
+  VALUE_LABELS,
+  canonicalScore,
+  canonicalYes,
+  rubricOf
+} from './lib/valueLabels.js'
 
 const PICKER_TYPES = [
   {
@@ -25,9 +34,9 @@ const toastText = ref('')
 const pending = ref(null)
 const savedAt = ref('')
 const jumpText = ref('1')
-const optionDraft = ref('')
 const customDrafts = reactive({})
 const htmlEdit = reactive({})
+const rubricHover = reactive({})
 const onlyOpen = ref(false)
 const activeCol = ref(0)
 const rowIndex = ref(0)
@@ -49,23 +58,29 @@ const columns = computed(() => view.value?.columns || [])
 const rows = computed(() => view.value?.rows || [])
 const formColumns = computed(() => {
   const long = []
-  const mark = []
   const rest = []
   for (const col of columns.value) {
     if (col.hidden) continue
-    if (col.role === 'label-result') mark.push(col)
-    else if (col.mode === 'text' && col.longText) long.push(col)
+    if (isLabelColumn(col)) continue
+    if (col.fileTree || col.role === 'file-tree' || fileTreeOf(col) || (col.mode === 'text' && col.longText)) long.push(col)
     else rest.push(col)
   }
-  return [...long, ...mark, ...rest]
+  return [...long, ...rest]
 })
-const leadColumns = computed(() => formColumns.value.filter((col) => col.role === 'label-result' || (col.mode === 'text' && col.longText)))
+const labelPaperCol = computed(() => columns.value.find((col) => col.role === 'label-paper') || null)
+const valueDimensions = computed(() =>
+  VALUE_KEYS.map((key) => ({
+    key,
+    title: VALUE_LABELS[key],
+    score: columns.value.find((col) => col.role === 'label-score' && col.valueKey === key) || null
+  })).filter((dim) => dim.score)
+)
+const leadColumns = computed(() => formColumns.value.filter((col) => col.fileTree || col.role === 'file-tree' || fileTreeOf(col) || (col.mode === 'text' && col.longText)))
 const dataColumns = computed(() => formColumns.value.filter((col) => !leadColumns.value.includes(col)))
 const fieldGroups = computed(() => [
   { id: 'lead', cols: leadColumns.value },
   { id: 'data', cols: dataColumns.value }
 ])
-const hiddenColumns = computed(() => columns.value.filter((col) => col.hidden))
 const loaded = computed(() => Boolean(views.value))
 const activeColumn = computed(() => columns.value[activeCol.value] || null)
 const current = computed(() => rows.value[rowIndex.value] || null)
@@ -119,30 +134,6 @@ const filledCount = computed(() => {
   return tracked.value.filter((col) => String(current.value.cells[col.index] || '').trim()).length
 })
 
-const structureIssues = computed(() => {
-  const issues = []
-  const counts = new Map()
-  for (const col of columns.value) {
-    if (col.hidden || col.role === 'label-result') continue
-    const key = col.label || col.letter
-    counts.set(key, (counts.get(key) || 0) + 1)
-  }
-  for (const [name, count] of counts) {
-    if (count > 1) issues.push(`字段「${name}」重复出现`)
-  }
-  return issues
-})
-
-const rowIssues = computed(() => {
-  const lines = [...structureIssues.value]
-  if (!current.value) return lines
-  for (const col of formColumns.value) {
-    for (const issue of fieldIssues(col)) lines.push(`${col.label}：${issue}`)
-  }
-  return lines
-})
-
-watch([activeSheet, activeCol], syncDraft)
 watch([rowIndex, onlyOpen, activeSheet, loading], () => {
   jumpText.value = String(rowIndex.value + 1)
   for (const key of Object.keys(customDrafts)) delete customDrafts[key]
@@ -151,7 +142,13 @@ watch([rowIndex, onlyOpen, activeSheet, loading], () => {
     document.title = `${pad(rowIndex.value + 1)} / ${rows.value.length} · 标引`
   }
   nextTick(() => requestAnimationFrame(() => {
-    document.querySelectorAll('textarea.full').forEach((el) => sizeText(el))
+    document.querySelectorAll('textarea.full').forEach((el) => {
+      if (el.value && el.value.length > 8000 && /fileName|file_tree/.test(el.value)) {
+        el.style.height = '8rem'
+        return
+      }
+      sizeText(el)
+    })
     drawMap()
   }))
 })
@@ -169,6 +166,14 @@ onBeforeUnmount(() => {
   clearTimeout(toastTimer)
 })
 
+function isLabelColumn(col) {
+  return col?.role === 'label-result' || col?.role === 'label-paper' || col?.role === 'label-yes' || col?.role === 'label-score'
+}
+
+function isYesNoLabel(col) {
+  return col?.role === 'label-result' || col?.role === 'label-paper' || col?.role === 'label-yes'
+}
+
 function pad(value) {
   return String(value).padStart(2, '0')
 }
@@ -176,11 +181,6 @@ function pad(value) {
 function rowDone(row) {
   if (!tracked.value.length || !row) return false
   return tracked.value.every((col) => String(row.cells[col.index] || '').trim())
-}
-
-function fieldNeed(col) {
-  if (!col.track || col.hidden || !current.value) return false
-  return !String(current.value.cells[col.index] || '').trim()
 }
 
 function fieldIssues(col) {
@@ -192,25 +192,48 @@ function fieldIssues(col) {
   if (text && text !== trimmed) issues.push('首尾有空白')
   if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u200B\uFEFF\u00A0]/.test(text)) issues.push('含不可见字符')
   if (/\t/.test(text)) issues.push('含制表符，可能串列')
-  if (col.role === 'label-result' && trimmed && !canonicalLabel(text)) issues.push('应是 1 或 0')
-  if (col.mode === 'single' && col.role !== 'label-result' && trimmed && col.options.length && !col.options.includes(trimmed)) {
+  if (isYesNoLabel(col)) {
+    if (trimmed && !canonicalYes(text)) issues.push('应是 1 或 0')
+  }
+  if (col.role === 'label-score' && trimmed && !canonicalScore(text)) issues.push('应是 0—4')
+  if (col.mode === 'single' && !isLabelColumn(col) && trimmed && col.options.length && !col.options.includes(trimmed)) {
     issues.push('不在可选项内')
   }
   return issues
 }
 
+const treeCache = new Map()
+
 function renderedHtml(col) {
   if (!current.value || !col) return ''
+  if (col.fileTree || col.role === 'file-tree') return ''
   const source = htmlSource(current.value.cells[col.index])
   return source ? sanitizeHtml(source) : ''
 }
 
+function fileTreeOf(col) {
+  if (!current.value || !col) return null
+  const raw = current.value.cells[col.index]
+  if (raw == null || raw === '') return null
+  const key = typeof raw === 'string' ? raw : String(raw)
+  if (treeCache.has(key)) return treeCache.get(key)
+  const tree = parseFileTree(key)
+  if (treeCache.size > 80) treeCache.clear()
+  treeCache.set(key, tree)
+  return tree
+}
+
 function showHtml(col) {
-  return Boolean(renderedHtml(col)) && !htmlEdit[col.index]
+  return Boolean(renderedHtml(col)) && !fileTreeOf(col) && !htmlEdit[col.index]
+}
+
+function showTree(col) {
+  return Boolean(fileTreeOf(col)) && !htmlEdit[col.index]
 }
 
 function widgetOf(col) {
   if (col.mode === 'single' || col.mode === 'multi') return col.mode
+  if (col.fileTree || col.role === 'file-tree') return 'textarea'
   const longest = rows.value.reduce((max, row) => Math.max(max, String(row.cells[col.index] || '').length), 0)
   return longest > 42 || col.track ? 'textarea' : 'input'
 }
@@ -227,26 +250,39 @@ function selectedList(col) {
   return [text]
 }
 
-function canonicalLabel(raw) {
-  const text = String(raw ?? '').trim().toLowerCase()
-  if (['1', '是', '是(1)', '是（1）', 'yes', 'y', 'true'].includes(text)) return '1'
-  if (['0', '否', '否(0)', '否（0）', 'no', 'n', 'false'].includes(text)) return '0'
-  return ''
-}
-
 function chipOptions(col) {
-  if (col.role === 'label-result') {
+  if (isYesNoLabel(col)) {
     return [
       { label: '是（1）', value: '1' },
       { label: '否（0）', value: '0' }
     ]
   }
+  if (col.role === 'label-score') {
+    return col.options.map((option) => ({
+      label: option,
+      value: option,
+      rubric: rubricOf(col.valueKey, option)
+    }))
+  }
   return col.options.map((option) => ({ label: option, value: option }))
 }
 
 function isChosen(col, option) {
-  if (col.role === 'label-result') return canonicalLabel(current.value?.cells[col.index]) === option.value
+  if (isYesNoLabel(col)) {
+    return canonicalYes(current.value?.cells[col.index]) === option.value
+  }
+  if (col.role === 'label-score') {
+    return canonicalScore(current.value?.cells[col.index]) === option.value
+  }
   return selectedList(col).includes(option.value)
+}
+
+function dimRubric(dim) {
+  if (!dim?.score) return ''
+  const hover = rubricHover[dim.key]
+  if (hover != null && hover !== '') return rubricOf(dim.key, hover)
+  const selected = canonicalScore(current.value?.cells[dim.score.index])
+  return selected ? rubricOf(dim.key, selected) : '按 0—4 分档细则给分，悬停或选中可查看说明。'
 }
 
 function toast(message) {
@@ -267,17 +303,13 @@ function runPending() {
   job?.()
 }
 
-function syncDraft() {
-  const col = columns.value[activeCol.value]
-  optionDraft.value = col ? col.options.join(' | ') : ''
-}
-
 function clearEdits() {
   for (const key of Object.keys(edits)) delete edits[key]
 }
 
 function applyLoaded(data, name, handle) {
   clearEdits()
+  treeCache.clear()
   filename.value = name
   bookType.value = data.bookType
   fileHandle.value = handle
@@ -292,7 +324,6 @@ function applyLoaded(data, name, handle) {
   savedAt.value = ''
   document.title = `${name} · 标引`
   nextTick(() => {
-    syncDraft()
     drawMap()
   })
 }
@@ -386,77 +417,6 @@ function selectSheet(name) {
   onlyOpen.value = false
 }
 
-function focusColumn(index) {
-  activeCol.value = index
-  document.getElementById(`field-${index}`)?.scrollIntoView({ block: 'center' })
-}
-
-function setMode(mode) {
-  const col = activeColumn.value
-  if (!col || col.readonly || col.role === 'version') return
-  col.mode = mode
-  if (mode !== 'text' && col.options.length < 2) {
-    const inferred = inferFromValues(rows.value.map((row) => String(row.cells[col.index] || '')))
-    if (inferred) {
-      col.options = inferred.options
-      col.separator = inferred.separator
-      col.optionSource = '取值归纳'
-      col.mode = inferred.mode
-    }
-  }
-  if (mode !== 'text') col.track = true
-  syncDraft()
-  nextTick(drawMap)
-}
-
-function toggleTrack() {
-  const col = activeColumn.value
-  if (!col) return
-  col.track = !col.track
-  nextTick(drawMap)
-}
-
-function onOptionKeydown(event) {
-  if (event.isComposing || event.key !== 'Enter') return
-  event.preventDefault()
-  applyOptions()
-}
-
-function applyOptions() {
-  const col = activeColumn.value
-  if (!col) return
-  const options = optionDraft.value
-    .split(/[|/,，、;；]/)
-    .map((item) => item.trim())
-    .filter(Boolean)
-  col.options = [...new Set(options)]
-  col.optionSource = '自定义'
-  if (col.options.length >= 2 && col.mode === 'text') {
-    col.mode = 'single'
-    col.track = true
-  }
-  toast(col.options.length ? '已更新可选项' : '已清空可选项')
-  nextTick(drawMap)
-}
-
-function recognize() {
-  const col = activeColumn.value
-  if (!col) return
-  const inferred = inferFromValues(rows.value.map((row) => String(row.cells[col.index] || '')))
-  if (!inferred) {
-    toast('这一列没有足够的重复取值')
-    return
-  }
-  col.options = inferred.options
-  col.mode = inferred.mode
-  col.separator = inferred.separator
-  col.optionSource = '取值归纳'
-  col.track = true
-  syncDraft()
-  toast('已按列中取值生成选项')
-  nextTick(drawMap)
-}
-
 function setCell(colIndex, value) {
   const row = rows.value[rowIndex.value]
   const col = columns.value[colIndex]
@@ -472,9 +432,18 @@ function setCell(colIndex, value) {
 
 function chooseSingle(col, option) {
   const raw = String(current.value?.cells[col.index] || '')
-  if (col.role === 'label-result') {
-    const selected = canonicalLabel(raw)
+  if (isYesNoLabel(col)) {
+    const selected = canonicalYes(raw)
     if (selected === option.value && (raw === '1' || raw === '0')) {
+      setCell(col.index, '')
+      return
+    }
+    setCell(col.index, option.value)
+    return
+  }
+  if (col.role === 'label-score') {
+    const selected = canonicalScore(raw)
+    if (selected === option.value) {
       setCell(col.index, '')
       return
     }
@@ -699,12 +668,6 @@ function onLeave(event) {
   event.preventDefault()
   event.returnValue = ''
 }
-
-function modeLabel(mode) {
-  if (mode === 'single') return '单选'
-  if (mode === 'multi') return '多选'
-  return '文本'
-}
 </script>
 
 <template>
@@ -779,73 +742,7 @@ function modeLabel(mode) {
     </section>
 
     <div v-else class="workspace">
-      <aside class="rail">
-        <div class="rail-head">
-          <p class="eyebrow">字段</p>
-          <span class="muted">{{ formColumns.length }}</span>
-        </div>
-        <p v-if="hiddenColumns.length" class="hidden-note">已隐藏 ID 列：{{ hiddenColumns.map((col) => col.label).join('、') }}</p>
-        <div class="col-list">
-          <button
-            v-for="col in formColumns"
-            :key="col.letter + col.index"
-            type="button"
-            class="col-item"
-            :class="{ active: activeCol === col.index }"
-            @click="focusColumn(col.index)"
-          >
-            <span class="idx">{{ col.letter }}</span>
-            <span class="col-name">{{ col.label }}</span>
-            <span class="col-meta">{{ col.role === 'version' ? '只读' : modeLabel(col.mode) }}<template v-if="col.optionSource && col.role !== 'version'"> · {{ col.optionSource }}</template></span>
-          </button>
-        </div>
-
-        <div v-if="activeColumn?.role === 'version'" class="rail-block">
-          <p class="eyebrow">{{ activeColumn.label }}</p>
-          <p class="hint">版本号只读，不会改写源文件。</p>
-        </div>
-        <div v-else-if="activeColumn" class="rail-block">
-          <p class="eyebrow">{{ activeColumn.label }}</p>
-          <div class="seg" role="group" aria-label="字段类型">
-            <button type="button" :class="{ on: activeColumn.mode === 'text' }" @click="setMode('text')">文本</button>
-            <button type="button" :class="{ on: activeColumn.mode === 'single' }" @click="setMode('single')">单选</button>
-            <button type="button" :class="{ on: activeColumn.mode === 'multi' }" @click="setMode('multi')">多选</button>
-          </div>
-          <div class="switch-row">
-            <span>计入完成度</span>
-            <button type="button" class="switch" :class="{ on: activeColumn.track }" :aria-pressed="activeColumn.track" aria-label="计入完成度" @click="toggleTrack">
-              <i></i>
-            </button>
-          </div>
-          <label class="editor-label" for="option-draft">可选项</label>
-          <input
-            id="option-draft"
-            v-model="optionDraft"
-            class="text-input"
-            placeholder="用 | 或逗号分隔"
-            @keydown="onOptionKeydown"
-          />
-          <button type="button" class="mini-btn" @click="applyOptions">应用选项</button>
-          <button type="button" class="mini-btn" @click="recognize">按取值重新识别</button>
-        </div>
-
-        <div class="rail-foot">
-          <div class="map-label">
-            <span>行</span>
-            <span>{{ rows.length }}</span>
-          </div>
-          <canvas ref="mapRef" class="minimap" aria-label="按行跳转" @click="onMapClick"></canvas>
-          <button type="button" class="filter-btn" :class="{ on: onlyOpen }" @click="onlyOpen = !onlyOpen">
-            {{ onlyOpen ? '正在只看未完成' : '只看未完成' }}
-          </button>
-          <p class="hint">← → 翻页 · Ctrl S 写回</p>
-          <p v-if="bookType === 'xls'" class="hint">XLS 写回会重建工作簿，复杂格式可能变化。</p>
-          <p v-else-if="fileHandle" class="hint">保存将覆盖源文件中改过的单元格。</p>
-          <p v-else class="hint">当前文件没有写入句柄，保存时下载新文件。</p>
-        </div>
-      </aside>
-
-      <main class="stage">
+      <div class="workspace-top">
         <div v-if="sheetNames.length > 1" class="sheet-tabs">
           <button
             v-for="name in sheetNames"
@@ -857,32 +754,160 @@ function modeLabel(mode) {
             {{ name }}
           </button>
         </div>
+        <div v-if="loading" class="loading-line workspace-loading"></div>
+      </div>
 
-        <div v-if="loading" class="loading-line"></div>
+      <div class="workspace-body">
+      <aside class="mark-pane">
+        <div class="pane-head">
+          <div>
+            <p class="eyebrow">打标</p>
+            <h2 class="pane-title">标注项</h2>
+          </div>
+          <div v-if="current" class="pane-head-meta">
+            <div class="jump-line">
+              <input class="jump" :value="jumpText" inputmode="numeric" aria-label="跳转到数据行" @change="jump($event.target.value)" />
+              <span class="muted">/ {{ rows.length }}</span>
+            </div>
+            <p class="progress-note">
+              <template v-if="tracked.length">本行 {{ filledCount }}/{{ tracked.length }}</template>
+              <template v-else>未设置完成度字段</template>
+            </p>
+          </div>
+        </div>
 
-        <div class="stage-scroll">
+        <div class="pane-scroll mark-scroll">
           <template v-if="current">
-            <div class="row-head">
-              <h2 class="row-index">{{ pad(rowIndex + 1) }}</h2>
-              <div class="row-side">
-                <div class="jump-line">
-                  <input class="jump" :value="jumpText" inputmode="numeric" aria-label="跳转到数据行" @change="jump($event.target.value)" />
-                  <span class="muted">/ {{ rows.length }}</span>
-                </div>
-                <p class="excel-row">源表第 {{ current.r + 1 }} 行</p>
-                <p class="progress-note">
-                  <template v-if="tracked.length">本行已填 {{ filledCount }}/{{ tracked.length }}</template>
-                  <template v-else>把需要填写的列设为计入完成度</template>
-                </p>
+            <div v-if="onlyOpen && !navList.length" class="clear-state compact">
+              <p class="eyebrow">CLEAR</p>
+              <h2>未完成行已清空</h2>
+              <button type="button" class="btn solid" @click="onlyOpen = false">查看全部行</button>
+            </div>
+
+            <template v-else-if="labelPaperCol || valueDimensions.length">
+            <section
+              v-if="labelPaperCol"
+              id="field-paper-panel"
+              class="field value-panel"
+              :class="{ active: activeColumn?.role === 'label-paper' }"
+              @pointerdown="activeCol = labelPaperCol.index"
+            >
+              <div class="field-top">
+                <span class="field-no">{{ pad(rowIndex + 1) }}</span>
+                <span class="field-label">数据论文</span>
+                <span class="source">是否推荐 · 1 / 0</span>
               </div>
+              <div class="value-overall">
+                <div class="value-dim-head">
+                  <strong>是否推荐为数据论文</strong>
+                  <span class="source">1 / 0</span>
+                </div>
+                <div class="chips" role="radiogroup" aria-label="是否推荐为数据论文">
+                  <button
+                    v-for="option in chipOptions(labelPaperCol)"
+                    :key="option.value"
+                    type="button"
+                    class="chip wide"
+                    :class="{ on: isChosen(labelPaperCol, option) }"
+                    role="radio"
+                    :aria-checked="isChosen(labelPaperCol, option)"
+                    @click="chooseSingle(labelPaperCol, option)"
+                  >
+                    {{ option.label }}
+                  </button>
+                </div>
+              </div>
+            </section>
+
+            <section
+              v-if="valueDimensions.length"
+              id="field-value-panel"
+              class="field value-panel"
+              :class="{ active: isLabelColumn(activeColumn) && activeColumn?.role !== 'label-paper' }"
+            >
+              <div class="field-top">
+                <span class="field-no">{{ pad(rowIndex + 1) }}</span>
+                <span class="field-label">价值打标</span>
+                <span class="source">0—4 分档</span>
+              </div>
+
+              <div
+                v-for="dim in valueDimensions"
+                :key="dim.key"
+                class="value-dim"
+                :class="{ active: activeColumn?.valueKey === dim.key }"
+                @pointerdown="activeCol = dim.score.index"
+              >
+                <div class="value-dim-head">
+                  <strong>{{ dim.key.toUpperCase() }} · {{ dim.title }}</strong>
+                </div>
+                <div class="chips score-chips" role="radiogroup" :aria-label="dim.score.label">
+                  <button
+                    v-for="option in chipOptions(dim.score)"
+                    :key="option.value"
+                    type="button"
+                    class="chip score"
+                    :class="{ on: isChosen(dim.score, option) }"
+                    role="radio"
+                    :aria-checked="isChosen(dim.score, option)"
+                    :title="option.rubric"
+                    @mouseenter="rubricHover[dim.key] = option.value"
+                    @mouseleave="rubricHover[dim.key] = ''"
+                    @focus="rubricHover[dim.key] = option.value"
+                    @blur="rubricHover[dim.key] = ''"
+                    @click="chooseSingle(dim.score, option)"
+                  >
+                    {{ option.label }}
+                  </button>
+                </div>
+                <p class="value-rubric">{{ dimRubric(dim) }}</p>
+              </div>
+            </section>
+            </template>
+
+            <div v-else class="empty-stage compact">
+              <p class="eyebrow">EMPTY</p>
+              <h2>没有可打标列</h2>
             </div>
+          </template>
+          <div v-else class="empty-stage compact">
+            <p class="eyebrow">EMPTY</p>
+            <h2>没有数据行</h2>
+          </div>
+        </div>
+
+        <div class="pane-foot mark-foot">
+          <div class="map-label">
+            <span>行</span>
+            <span>{{ rows.length }}</span>
+          </div>
+          <canvas ref="mapRef" class="minimap" aria-label="按行跳转" @click="onMapClick"></canvas>
+          <button type="button" class="filter-btn" :class="{ on: onlyOpen }" @click="onlyOpen = !onlyOpen">
+            {{ onlyOpen ? '正在只看未完成' : '只看未完成' }}
+          </button>
+          <div class="pager compact">
+            <button type="button" class="btn" :disabled="!canPrev" @click="step(-1)">上一页</button>
+            <span class="page-count">{{ navLabel }}</span>
+            <button type="button" class="btn" :disabled="!canNext" @click="step(1)">下一页</button>
+          </div>
+          <p class="hint">← → 翻页 · Ctrl S 写回</p>
+        </div>
+      </aside>
+
+      <main class="detail-pane">
+        <div class="pane-head">
+          <div>
+            <p class="eyebrow">详情</p>
+            <h2 class="pane-title">数据字段</h2>
+          </div>
+          <div v-if="current" class="pane-head-meta">
+            <p class="excel-row">源表第 {{ current.r + 1 }} 行</p>
+          </div>
+        </div>
+
+        <div class="pane-scroll detail-scroll">
+          <template v-if="current">
             <p v-if="view?.banner" class="banner">{{ view.banner }}</p>
-            <div v-if="rowIssues.length" class="issues">
-              <p class="eyebrow">格式</p>
-              <ul>
-                <li v-for="issue in rowIssues" :key="issue">{{ issue }}</li>
-              </ul>
-            </div>
 
             <div v-if="onlyOpen && !navList.length" class="clear-state">
               <p class="eyebrow">CLEAR</p>
@@ -890,35 +915,42 @@ function modeLabel(mode) {
               <button type="button" class="btn solid" @click="onlyOpen = false">查看全部行</button>
             </div>
 
-            <form v-else :key="activeSheet + '-' + rowIndex" class="form" @submit.prevent>
+            <form v-else :key="activeSheet + '-' + rowIndex" class="form detail-form" @submit.prevent>
               <div v-for="group in fieldGroups" :key="group.id" :class="group.id === 'data' ? 'data-grid' : 'lead-stack'">
                 <section
                   v-for="col in group.cols"
                   :id="'field-' + col.index"
                   :key="col.index"
                   class="field"
-                  :class="{ active: activeCol === col.index, need: fieldNeed(col), reading: col.mode === 'text' && col.longText, result: col.role === 'label-result', version: col.role === 'version', bad: fieldIssues(col).length }"
+                  :class="{ active: activeCol === col.index, reading: col.mode === 'text' && col.longText, version: col.role === 'version' }"
                   @pointerdown="activeCol = col.index"
                 >
                   <div class="field-top">
-                    <span class="field-no">{{ pad(col.index + 1) }}</span>
+                    <span class="field-no">{{ col.letter }}</span>
                     <span class="field-label">{{ col.label }}</span>
-                    <span v-if="col.role === 'label-result'" class="source">单选 · 写入 1 / 0</span>
-                    <span v-else-if="col.role === 'version'" class="source">只读<template v-if="renderedHtml(col)"> · HTML</template></span>
-                    <span v-else-if="renderedHtml(col)" class="source">HTML · {{ modeLabel(col.mode) }}</span>
-                    <span v-else-if="col.optionSource" class="source">可选项 · {{ col.optionSource }} · {{ col.options.length }}</span>
-                    <span v-else class="source">{{ modeLabel(col.mode) }}</span>
+                    <span v-if="col.role === 'version'" class="source">只读<template v-if="fileTreeOf(col)"> · 目录</template><template v-else-if="renderedHtml(col)"> · HTML</template></span>
+                    <span v-else-if="fileTreeOf(col)" class="source">目录</span>
+                    <span v-else-if="renderedHtml(col)" class="source">HTML</span>
                   </div>
 
                   <div v-if="col.role === 'version'" class="readonly-value">
-                    <div v-if="renderedHtml(col)" class="html-view" v-html="renderedHtml(col)"></div>
+                    <div v-if="fileTreeOf(col)" class="file-tree" role="tree" :aria-label="col.label">
+                      <FileTree :node="fileTreeOf(col)" />
+                    </div>
+                    <div v-else-if="renderedHtml(col)" class="html-view" v-html="renderedHtml(col)"></div>
                     <template v-else>{{ current.cells[col.index] || '—' }}</template>
                   </div>
-                  <div v-else-if="col.role !== 'label-result' && showHtml(col)" class="html-block">
+                  <div v-else-if="showTree(col)" class="html-block">
+                    <div class="file-tree" role="tree" :aria-label="col.label">
+                      <FileTree :node="fileTreeOf(col)" />
+                    </div>
+                    <button type="button" class="html-toggle" @click.stop="htmlEdit[col.index] = true">编辑原文</button>
+                  </div>
+                  <div v-else-if="showHtml(col)" class="html-block">
                     <div class="html-view" :class="{ full: col.longText }" v-html="renderedHtml(col)"></div>
                     <button type="button" class="html-toggle" @click.stop="htmlEdit[col.index] = true">编辑原文</button>
                   </div>
-                  <template v-else-if="col.role !== 'label-result' && widgetOf(col) === 'textarea'">
+                  <template v-else-if="widgetOf(col) === 'textarea'">
                     <textarea
                       :class="['grow', { full: col.longText }]"
                       :aria-label="col.label"
@@ -927,26 +959,26 @@ function modeLabel(mode) {
                       :ref="(el) => sizeText(el)"
                       @input="setCell(col.index, $event.target.value); autosize($event)"
                     ></textarea>
-                    <button v-if="renderedHtml(col)" type="button" class="html-toggle" @click.stop="htmlEdit[col.index] = false">渲染样式</button>
+                    <button v-if="fileTreeOf(col) || renderedHtml(col)" type="button" class="html-toggle" @click.stop="htmlEdit[col.index] = false">{{ fileTreeOf(col) ? '渲染目录' : '渲染样式' }}</button>
                   </template>
-                  <template v-else-if="col.role !== 'label-result' && widgetOf(col) === 'input'">
+                  <template v-else-if="widgetOf(col) === 'input'">
                     <input
                       class="text-input line-input"
                       :aria-label="col.label"
                       :value="current.cells[col.index]"
                       @input="setCell(col.index, $event.target.value)"
                     />
-                    <button v-if="renderedHtml(col)" type="button" class="html-toggle" @click.stop="htmlEdit[col.index] = false">渲染样式</button>
+                    <button v-if="fileTreeOf(col) || renderedHtml(col)" type="button" class="html-toggle" @click.stop="htmlEdit[col.index] = false">{{ fileTreeOf(col) ? '渲染目录' : '渲染样式' }}</button>
                   </template>
                   <div v-else>
-                    <p v-if="col.role !== 'label-result' && !col.options.length" class="empty-options">还没有可选项。可以在左侧补充，或直接输入。</p>
+                    <p v-if="!col.options.length" class="empty-options">还没有可选项，可以直接输入。</p>
                     <div :class="['chips', { scroll: col.options.length > 12 }]" :role="col.mode === 'multi' ? 'group' : 'radiogroup'" :aria-label="col.label">
                       <button
                         v-for="option in chipOptions(col)"
                         :key="option.value"
                         type="button"
                         class="chip"
-                        :class="{ on: isChosen(col, option), wide: col.role === 'label-result' }"
+                        :class="{ on: isChosen(col, option) }"
                         :role="col.mode === 'multi' ? 'checkbox' : 'radio'"
                         :aria-checked="isChosen(col, option)"
                         @click="col.mode === 'multi' ? chooseMulti(col, option.value) : chooseSingle(col, option)"
@@ -954,7 +986,6 @@ function modeLabel(mode) {
                         {{ option.label }}
                       </button>
                       <input
-                        v-if="col.role !== 'label-result'"
                         class="custom-input"
                         placeholder="其他，回车写入"
                         :value="customDrafts[col.index] || ''"
@@ -975,12 +1006,13 @@ function modeLabel(mode) {
           </div>
         </div>
 
-        <div class="pager">
-          <button type="button" class="btn" :disabled="!canPrev" @click="step(-1)">上一页</button>
-          <span class="page-count">{{ navLabel }}</span>
-          <button type="button" class="btn" :disabled="!canNext" @click="step(1)">下一页</button>
+        <div class="pane-foot detail-foot">
+          <p v-if="bookType === 'xls'" class="hint">XLS 写回会重建工作簿，复杂格式可能变化。</p>
+          <p v-else-if="fileHandle" class="hint">保存将覆盖源文件中改过的单元格。</p>
+          <p v-else class="hint">当前文件没有写入句柄，保存时下载新文件。</p>
         </div>
       </main>
+      </div>
     </div>
 
     <div v-if="toastText" class="toast" role="status">{{ toastText }}</div>
