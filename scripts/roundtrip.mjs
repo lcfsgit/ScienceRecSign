@@ -1,7 +1,9 @@
+import { formatUpdateDate, isUpdateDateColumn } from '../src/lib/datetime.js'
+import { doiLinks, isDoiColumn, isPapersColumn, linkifyDois, paperView } from '../src/lib/doi.js'
 import { buildDemoBuffer } from '../src/lib/demo.js'
 import { containsHtml, htmlSource } from '../src/lib/html.js'
 import { buildOutputBytes, cellAddress, loadWorkbook, parseHeader } from '../src/lib/sheet.js'
-import { parseFileTree } from '../src/lib/tree.js'
+import { isRestrictedFileTreeText, parseFileTree, treeLabel } from '../src/lib/tree.js'
 
 const tree = parseFileTree('{"file_tree":{"id":"v1","fileName":"V1","path":"/V1","type":"folder","dir":true,"size":0,"children":[{"id":"csv","fileName":"data.csv","path":"/V1/data.csv","type":"file","dir":false,"size":1024}]}}')
 if (!tree || tree.fileName !== 'V1' || !tree.dir || tree.children[0]?.fileName !== 'data.csv' || tree.children[0]?.size !== 1024) {
@@ -20,6 +22,50 @@ if (!wrapped || wrapped.children[0]?.fileName !== 'a.xlsx') throw new Error('包
 const doubled = parseFileTree(JSON.stringify('{"fileName":"V1","dir":true,"children":[]}'))
 if (!doubled || doubled.fileName !== 'V1') throw new Error('二次编码 JSON 目录树识别失败')
 if (parseFileTree('普通备注')) throw new Error('普通文本不应识别为目录树')
+const blockedName = `\uFFFD`.repeat(12)
+const blocked = parseFileTree(`{"fileName":"V1","dir":true,"children":[{"fileName":"${blockedName}.xlsx","dir":false,"size":12},{"fileName":"notes.txt","dir":false,"size":8}]}`)
+if (!blocked || treeLabel(blocked.children[0]) !== '该文件限制访问' || treeLabel(blocked.children[1]) !== 'notes.txt') {
+  throw new Error('限制访问的文件名未替换')
+}
+if (!isRestrictedFileTreeText(`{"fileName":"${blockedName}"}`) || isRestrictedFileTreeText('{"fileName":"notes.txt","dir":false}')) {
+  throw new Error('无法解析的限制访问目录识别失败')
+}
+if (!isDoiColumn({ label: 'doi' }) || !isDoiColumn({ headerRaw: '相关DOI' }) || isDoiColumn({ label: '标题' })) {
+  throw new Error('DOI 列识别失败')
+}
+const doi = doiLinks('10.11922/sciencedb.j00104.00101')
+if (doi.length !== 1 || doi[0].href !== 'https://www.bing.com/search?q=10.11922%2Fsciencedb.j00104.00101') {
+  throw new Error(`DOI 链接错误: ${JSON.stringify(doi)}`)
+}
+if (doiLinks('https://doi.org/10.1007/s10118-025-3353-3')[0]?.text !== '10.1007/s10118-025-3353-3') {
+  throw new Error('完整 DOI 网址未还原成标识')
+}
+if (doiLinks('').length) throw new Error('空 DOI 不应生成链接')
+const papers = paperView('[{"title":"土壤数据集","doi":"10.11922/sciencedb.460"},{"title":"无标识"}]')
+if (papers.kind !== 'items' || papers.items[0]?.links[0]?.href !== 'https://www.bing.com/search?q=10.11922%2Fsciencedb.460') {
+  throw new Error(`papers 中的 DOI 未变成链接: ${JSON.stringify(papers)}`)
+}
+if (!papers.items[1] || papers.items[1].links.length) throw new Error('无 DOI 的论文不应生成搜索链接')
+const linked = linkifyDois('<p>见 https://doi.org/10.1007/s10118-025-3353-3。</p>')
+if (!linked.includes('href="https://www.bing.com/search?q=10.1007%2Fs10118-025-3353-3"') || !linked.startsWith('<p>')) {
+  throw new Error(`正文 DOI 未链接化: ${linked}`)
+}
+if (!isPapersColumn({ label: 'papers' }) || !isPapersColumn({ headerRaw: 'related_papers' }) || isPapersColumn({ label: 'newspapers' })) {
+  throw new Error('papers 列识别失败')
+}
+
+if (!isUpdateDateColumn({ label: 'dataSetUpdateDate' }) || isUpdateDateColumn({ label: 'doi' })) {
+  throw new Error('更新时间列识别失败')
+}
+const isoStamp = '2022-12-29T08:13:27.948Z'
+const formatted = formatUpdateDate(isoStamp)
+if (formatted !== '2022-12-29 08:13') throw new Error(`ISO 时间格式化失败: ${formatted}`)
+const ms = Date.parse(isoStamp)
+if (formatUpdateDate(ms) !== formatted || formatUpdateDate(String(Math.floor(ms / 1000))) !== formatted) {
+  throw new Error('时间戳未格式化为同一年月日时分')
+}
+if (formatUpdateDate('') !== '') throw new Error('空时间应保持空白')
+
 if (!containsHtml('<p>正文<b>重点</b></p>') || containsHtml('a < b')) {
   throw new Error('HTML 识别失败')
 }

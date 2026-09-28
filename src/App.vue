@@ -1,10 +1,12 @@
 <script setup>
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import FileTree from './components/FileTree.vue'
+import { formatUpdateDate, isUpdateDateColumn } from './lib/datetime.js'
 import { buildDemoBuffer } from './lib/demo.js'
+import { doiLinks, isDoiColumn, isPapersColumn, linkifyDois, paperView } from './lib/doi.js'
 import { htmlSource, sanitizeHtml } from './lib/html.js'
 import { buildOutputBytes, cellAddress, loadWorkbook, mimeOf } from './lib/sheet.js'
-import { parseFileTree } from './lib/tree.js'
+import { parseFileTree, isRestrictedFileTreeText, RESTRICTED_FILE_LABEL } from './lib/tree.js'
 import {
   VALUE_KEYS,
   VALUE_LABELS,
@@ -227,8 +229,21 @@ function showHtml(col) {
   return Boolean(renderedHtml(col)) && !fileTreeOf(col) && !htmlEdit[col.index]
 }
 
+function papersOf(col) {
+  const raw = current.value?.cells[col.index]
+  const view = paperView(raw)
+  if (view.kind !== 'html') return view
+  const base = renderedHtml(col) || String(raw ?? '')
+  return { ...view, html: linkifyDois(base) }
+}
+
 function showTree(col) {
   return Boolean(fileTreeOf(col)) && !htmlEdit[col.index]
+}
+
+function showRestrictedTree(col) {
+  if (!current.value || htmlEdit[col.index] || fileTreeOf(col)) return false
+  return isRestrictedFileTreeText(current.value.cells[col.index])
 }
 
 function widgetOf(col) {
@@ -929,7 +944,10 @@ function onLeave(event) {
                     <span class="field-no">{{ col.letter }}</span>
                     <span class="field-label">{{ col.label }}</span>
                     <span v-if="col.role === 'version'" class="source">只读<template v-if="fileTreeOf(col)"> · 目录</template><template v-else-if="renderedHtml(col)"> · HTML</template></span>
+                    <span v-else-if="isDoiColumn(col) || isPapersColumn(col)" class="source">链接</span>
+                    <span v-else-if="isUpdateDateColumn(col)" class="source">年月日时分</span>
                     <span v-else-if="fileTreeOf(col)" class="source">目录</span>
+                    <span v-else-if="showRestrictedTree(col)" class="source">限制访问</span>
                     <span v-else-if="renderedHtml(col)" class="source">HTML</span>
                   </div>
 
@@ -940,6 +958,34 @@ function onLeave(event) {
                     <div v-else-if="renderedHtml(col)" class="html-view" v-html="renderedHtml(col)"></div>
                     <template v-else>{{ current.cells[col.index] || '—' }}</template>
                   </div>
+                  <div v-else-if="isDoiColumn(col)" class="doi-links">
+                    <template v-for="link in doiLinks(current.cells[col.index])" :key="link.href || link.text">
+                      <a v-if="link.href" :href="link.href" target="_blank" rel="noopener noreferrer" @click.stop>{{ link.text }}</a>
+                      <span v-else>{{ link.text }}</span>
+                    </template>
+                    <span v-if="!doiLinks(current.cells[col.index]).length">—</span>
+                  </div>
+                  <div v-else-if="isUpdateDateColumn(col)" class="readonly-value">{{ formatUpdateDate(current.cells[col.index]) || '—' }}</div>
+                  <div v-else-if="isPapersColumn(col)" class="paper-list">
+                    <template v-if="papersOf(col).kind === 'items'">
+                      <div v-for="(item, index) in papersOf(col).items" :key="index" class="paper-item">
+                        <p v-if="item.title" class="paper-title">{{ item.title }}</p>
+                        <div class="doi-links">
+                          <a
+                            v-for="link in item.links"
+                            :key="link.href"
+                            :href="link.href"
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            @click.stop
+                          >{{ link.text }}</a>
+                        </div>
+                      </div>
+                    </template>
+                    <div v-else-if="papersOf(col).kind === 'html'" class="html-view" v-html="papersOf(col).html"></div>
+                    <div v-else class="readonly-value">{{ papersOf(col).text || '—' }}</div>
+                  </div>
+                  <div v-else-if="showRestrictedTree(col)" class="readonly-value">{{ RESTRICTED_FILE_LABEL }}</div>
                   <div v-else-if="showTree(col)" class="html-block">
                     <div class="file-tree" role="tree" :aria-label="col.label">
                       <FileTree :node="fileTreeOf(col)" />

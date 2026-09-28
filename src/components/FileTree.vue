@@ -1,6 +1,6 @@
 <script setup>
 import { computed, ref } from 'vue'
-import { formatSize } from '../lib/tree.js'
+import { formatSize, RESTRICTED_FILE_LABEL, treeLabel } from '../lib/tree.js'
 
 const props = defineProps({
   node: { type: Object, required: true }
@@ -8,6 +8,8 @@ const props = defineProps({
 
 const open = ref(true)
 const isDir = computed(() => props.node.dir || props.node.type === 'folder')
+const label = computed(() => treeLabel(props.node))
+const restricted = computed(() => label.value === RESTRICTED_FILE_LABEL)
 const meta = computed(() => {
   if (isDir.value) {
     const count = props.node.children?.length || 0
@@ -26,13 +28,13 @@ function onClick() {
     <button
       type="button"
       class="tree-row"
-      :class="{ dir: isDir, file: !isDir }"
+      :class="{ dir: isDir, file: !isDir, restricted }"
       :aria-expanded="isDir ? open : undefined"
-      :title="node.path || node.fileName"
+      :title="restricted ? label : (node.path || node.fileName)"
       @click.stop="onClick"
     >
       <span class="tree-twist" aria-hidden="true">{{ isDir ? (open ? '▾' : '▸') : '·' }}</span>
-      <span class="tree-name">{{ node.fileName }}</span>
+      <span class="tree-name">{{ label }}</span>
       <span v-if="meta" class="tree-meta">{{ meta }}</span>
     </button>
     <div v-if="isDir && open && node.children?.length" class="tree-children" role="group">

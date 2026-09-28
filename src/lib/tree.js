@@ -1,3 +1,5 @@
+export const RESTRICTED_FILE_LABEL = '该文件限制访问'
+
 export function looksLikeFileTree(value) {
   const text = String(value ?? '').trim()
   if (text.length < 16) return false
@@ -31,6 +33,22 @@ export function formatSize(size) {
   }
   const digits = value >= 10 ? 0 : 1
   return `${value.toFixed(digits)} ${units[index]}`
+}
+
+export function treeLabel(node) {
+  const name = String(node?.fileName || '')
+  if (isRestrictedFileName(name)) return RESTRICTED_FILE_LABEL
+  return name
+}
+
+export function isRestrictedFileTreeText(value) {
+  const text = String(value ?? '')
+  if (!/\uFFFD{6,}/.test(text) || parseFileTree(text)) return false
+  return /file_tree|fileName/.test(text) || !/[A-Za-z0-9\u4e00-\u9fff]/.test(text.replace(/\uFFFD/g, ''))
+}
+
+function isRestrictedFileName(name) {
+  return /\uFFFD{4,}/.test(String(name || ''))
 }
 
 function prepareText(value) {

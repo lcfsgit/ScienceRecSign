@@ -651,6 +651,36 @@ button { cursor: pointer; }
   word-break: break-word;
 }
 
+.doi-links {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  min-height: 36px;
+}
+
+..html-view a,
+.doi-links a {
+  color: var(--lime) !important;
+  font-size: 16px;
+  line-height: 1.5;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  word-break: break-all;
+}
+
+.paper-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.paper-title {
+  margin: 0 0 4px;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
 .html-block {
   display: flex;
   flex-direction: column;
@@ -757,6 +787,10 @@ button { cursor: pointer; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.tree-row.restricted .tree-name {
+  color: var(--muted);
 }
 
 .tree-meta {
